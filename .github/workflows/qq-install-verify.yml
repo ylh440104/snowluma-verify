@@ -1,0 +1,57 @@
+name: qq-install-verify
+
+on: workflow_dispatch
+
+jobs:
+  install:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reassemble and verify installer
+        shell: pwsh
+        run: ./reassemble.ps1
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'QQ_setup.exe'
+          "installing: $exe"
+          $args = @('/S')
+          $p = Start-Process -FilePath $exe -ArgumentList $args -PassThru -Wait
+          "installer exit code: $($p.ExitCode)"
+
+      - name: Locate QQ
+        shell: pwsh
+        run: |
+          $cands = @(
+            'C:\Program Files\Tencent\QQNT\QQ.exe',
+            'C:\Program Files (x86)\Tencent\QQNT\QQ.exe',
+            "$env:LOCALAPPDATA\Programs\Tencent\QQNT\QQ.exe"
+          )
+          foreach ($c in $cands) { "check $c -> $(Test-Path $c)" }
+          $found = Get-ChildItem 'C:\' -Recurse -Filter 'QQ.exe' -Depth 7 -ErrorAction SilentlyContinue |
+                   Select-Object -First 10
+          "--- QQ.exe found ---"
+          $found | ForEach-Object { $_.FullName }
+          if (-not $found) { "NONE FOUND" }
+
+      - name: Report version
+        shell: pwsh
+        run: |
+          $q = Get-ChildItem 'C:\' -Recurse -Filter 'QQ.exe' -Depth 7 -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+          if (-not $q) { "NO QQ"; exit 0 }
+          "path: $($q.FullName)"
+          $v = $q.VersionInfo
+          "FileVersion    : $($v.FileVersion)"
+          "ProductVersion : $($v.ProductVersion)"
+          "FileDescription: $($v.FileDescription)"
+          $verDir = Join-Path $q.DirectoryName 'resources\app\versions'
+          if (Test-Path $verDir) {
+            "--- payload versions ---"
+            Get-ChildItem $verDir -Directory | ForEach-Object { $_.Name }
+          }
+          "--- top level ---"
+          Get-ChildItem $q.DirectoryName | Select-Object -First 25 | ForEach-Object { $_.Name }
