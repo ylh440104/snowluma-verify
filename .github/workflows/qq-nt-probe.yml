@@ -1,0 +1,133 @@
+name: qq-nt-probe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  windows-probe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Runner info
+        shell: pwsh
+        run: |
+          "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          "Version: $([System.Environment]::OSVersion.Version)"
+          "Arch: $env:PROCESSOR_ARCHITECTURE"
+          "PS: $($PSVersionTable.PSVersion)"
+          Get-PSDrive C | Select-Object Used,Free
+
+      - name: Resolve QQ NT download metadata
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $page = Invoke-WebRequest -Uri 'https://im.qq.com/pcqq/index.shtml' -UseBasicParsing -TimeoutSec 60
+          $html = $page.Content
+          $m = [regex]::Matches($html, 'v\s*(\d+\.\d+\.\d+)')
+          "PAGE_VERSION_HITS: " + (($m | ForEach-Object { $_.Groups[1].Value }) -join ',')
+
+          $links = [regex]::Matches($html, 'https?://[^"''\s]+?\.(exe|zip|dmg)')
+          "DOWNLOAD_LINKS_FOUND: " + $links.Count
+          foreach ($l in $links) { "LINK: " + $l.Value }
+
+          $cdn = [regex]::Matches($html, 'dldir[\w\.\-]*\.qq\.com[^"''\s]*')
+          foreach ($c in $cdn) { "CDN: " + $c.Value }
+
+      - name: Probe known CDN path patterns
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $patterns = @(
+            'https://dldir1.qq.com/qqfile/qq/QQNT/Windows/QQ_9.9.37_260110_01_x64_01.exe',
+            'https://dldir1.qq.com/qqfile/qq/QQNT/Windows/QQ_9.9.19_250916_01_x64_01.exe',
+            'https://dldir1.qq.com/qqfile/qq/QQNT/Windows/QQ_9.9.15_250501_01_x64_01.exe'
+          )
+          foreach ($p in $patterns) {
+            try {
+              $r = Invoke-WebRequest -Uri $p -Method Head -UseBasicParsing -TimeoutSec 30
+              "OK $($r.StatusCode) len=$($r.Headers.'Content-Length') $p"
+            } catch {
+              "FAIL $($_.Exception.Message.Substring(0,[Math]::Min(80,$_.Exception.Message.Length))) $p"
+            }
+          }
+
+      - name: Inspect SnowLuma win-x64 package
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $url = 'https://github.com/XingYunStar/snowluma/releases/download/v2.4.2/SnowLuma-v2.4.2-win-x64.zip'
+          $out = Join-Path $env:RUNNER_TEMP 'snowluma.zip'
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 300
+            $h = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+            "SHA256: $h"
+            "EXPECT: 0912926c5e73260f35b000278a8658493fc9452f36782c32fa86f0e825bad81a"
+            "MATCH: $($h -eq '0912926c5e73260f35b000278a8658493fc9452f36782c32fa86f0e825bad81a')"
+            "SIZE: $((Get-Item $out).Length)"
+          } catch {
+            "DOWNLOAD_FAILED: $($_.Exception.Message)"
+            exit 0
+          }
+
+          $dst = Join-Path $env:RUNNER_TEMP 'snowluma'
+          Expand-Archive -Path $out -DestinationPath $dst -Force
+          "--- TOP LEVEL ---"
+          Get-ChildItem $dst | Select-Object Name,Length | Format-Table -AutoSize | Out-String -Width 200
+
+          "--- NATIVE ADDONS ---"
+          Get-ChildItem $dst -Recurse -Include *.node,*.dll,*.exe -ErrorAction SilentlyContinue |
+            Select-Object FullName,Length | Format-Table -AutoSize | Out-String -Width 250
+
+      - name: Read native addon PE headers
+        shell: pwsh
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP 'snowluma'
+          if (-not (Test-Path $dst)) { "SKIP: no package"; exit 0 }
+          $nodes = Get-ChildItem $dst -Recurse -Include *.node,*.dll -ErrorAction SilentlyContinue
+          foreach ($f in $nodes) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            $arch = switch ($machine) { 0x8664 {'x64'} 0xAA64 {'arm64'} 0x14c {'x86'} default {"0x{0:X}" -f $machine} }
+            "FILE: $($f.Name) arch=$arch"
+          }
+
+      - name: Probe SnowLuma startup
+        shell: pwsh
+        run: |
+          $dst = Join-Path $env:RUNNER_TEMP 'snowluma'
+          if (-not (Test-Path $dst)) { "SKIP: no package"; exit 0 }
+          $launcher = Get-ChildItem $dst -Recurse -Filter 'launcher.bat' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $launcher) { "NO_LAUNCHER"; exit 0 }
+          "LAUNCHER: $($launcher.FullName)"
+          Push-Location $launcher.DirectoryName
+          $env:SNOWLUMA_WEBUI_PORT = '5099'
+          $job = Start-Job -ScriptBlock {
+            param($dir)
+            Set-Location $dir
+            citool 2>$null | Out-Null
+            & cmd /c launcher.bat 2>&1
+          } -ArgumentList $launcher.DirectoryName
+          Start-Sleep -Seconds 25
+          "--- JOB OUTPUT ---"
+          Receive-Job $job -Keep
+          "--- PORT CHECK ---"
+          try {
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:5099' -UseBasicParsing -TimeoutSec 10
+            "WEBUI_STATUS: $($r.StatusCode)"
+          } catch {
+            "WEBUI_UNREACHABLE: $($_.Exception.Message.Substring(0,[Math]::Min(120,$_.Exception.Message.Length)))"
+          }
+          Stop-Job $job -ErrorAction SilentlyContinue
+          Remove-Job $job -Force -ErrorAction SilentlyContinue
+          Pop-Location
+
+      - name: Node and runtime check
+        shell: pwsh
+        run: |
+          node --version
+          npm --version
+          "QQ_INSTALLED: $(Test-Path 'C:\Program Files\Tencent\QQNT\QQ.exe')"
+          "QQ_REG: $(Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*QQ*' } | Select-Object -ExpandProperty DisplayName)"
