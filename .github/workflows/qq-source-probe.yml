@@ -1,0 +1,14 @@
+name: qq-source-probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe QQ sources
+        shell: pwsh
+        run: ./qqsrc.ps1
