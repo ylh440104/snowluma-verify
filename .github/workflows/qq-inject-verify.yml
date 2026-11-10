@@ -1,0 +1,62 @@
+name: qq-inject-verify
+
+on: workflow_dispatch
+
+jobs:
+  inject:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reassemble installer
+        shell: pwsh
+        run: ./reassemble.ps1
+
+      - name: Silent install QQ
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'QQ_setup.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '/S' -PassThru -Wait
+          "installer exit: $($p.ExitCode)"
+          "qq present: $(Test-Path 'C:\Program Files\Tencent\QQNT\QQ.exe')"
+
+      - name: Fetch SnowLuma runtime
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sl.zip'
+          Invoke-WebRequest -Uri 'https://github.com/XingYunStar/snowluma/releases/download/v2.4.2/SnowLuma-v2.4.2-win-x64.zip' -OutFile $zip -UseBasicParsing -TimeoutSec 600
+          Expand-Archive $zip -DestinationPath (Join-Path $PWD 'sl') -Force
+          Copy-Item (Join-Path $PWD 'sl\native') (Join-Path $PWD 'native') -Recurse -Force
+          Copy-Item (Join-Path $PWD 'sl\node.exe') (Join-Path $PWD 'node.exe') -Force
+          "native ready: $(Test-Path .\native\snowluma-win32-x64.dll)"
+
+      - name: Launch QQ and probe injection
+        shell: pwsh
+        run: ./probe-qq.ps1
+
+      - name: Start SnowLuma and inspect WebUI
+        shell: pwsh
+        run: |
+          $dir = Join-Path $PWD 'sl'
+          Push-Location $dir
+          $job = Start-Job -ScriptBlock {
+            param($d)
+            Set-Location $d
+            & cmd /c launcher.bat 2>&1
+          } -ArgumentList $dir
+          Start-Sleep -Seconds 30
+          "--- SnowLuma output ---"
+          Receive-Job $job -Keep | Select-Object -First 60
+          "--- WebUI ---"
+          try {
+            $r = Invoke-WebRequest 'http://127.0.0.1:5099' -UseBasicParsing -TimeoutSec 10
+            "WEBUI_STATUS: $($r.StatusCode)"
+          } catch {
+            "WEBUI_UNREACHABLE: $($_.Exception.Message.Substring(0,[Math]::Min(100,$_.Exception.Message.Length)))"
+          }
+          "--- QQ procs now ---"
+          Get-Process -Name 'QQ' -ErrorAction SilentlyContinue | ForEach-Object { "pid=$($_.Id)" }
+          Stop-Job $job -ErrorAction SilentlyContinue
+          Remove-Job $job -Force -ErrorAction SilentlyContinue
+          Pop-Location
